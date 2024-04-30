@@ -1,0 +1,327 @@
+---
+title: "RNA-seq differential gene expression"
+subtitle: "Uganda: HIV+ vs HIV- TB-induced RSTR vs LTBI"
+author: "Kim Dill-McFarland kadm@uw.edu"
+date: "version `r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float:
+      collapsed: no
+editor_options:
+  chunk_output_type: console
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(fig.height=4, fig.width = 8.5, echo=FALSE,message=FALSE, warning=FALSE) 
+
+```
+
+# Background
+
+The purpose of this workflow is to identify TB-induced differentially expressed genes (DEG) in HIV+ individuals and compare these DEGs to those identified separately for HIV- individuals.
+
+# Setup
+Load packages
+
+```{r message=FALSE, warning=FALSE}
+# Data manipulation and figures
+library(tidyverse)
+    # Multi-panel figures for ggplot
+    library(patchwork)
+    #Custom figures
+    library(BIGpicture)
+
+#Enrichment
+library(SEARchways)
+
+# Print tty table to knit file
+library(knitr)
+library(kableExtra)
+
+`%notin%` <- Negate(`%in%`)
+```
+
+Set seed
+
+```{r}
+set.seed(4389)
+```
+
+# Load data
+## HIV+
+
+```{r message=FALSE, warning=FALSE}
+#Load data
+# load("data_clean/HIV_pos_voom.RData")
+load("results/HIVpos_lme.RData")
+
+HIV_pos_results <- model_intr$lme
+```
+
+## HIV-
+
+```{r}
+HIV_neg_results <- read_csv("results/HIVneg/RSTR.Mtb.model.results.anno.csv") %>% 
+  #Rename var to match HIV+
+  mutate(variable = recode(variable, 
+                           "Sample_GroupRSTR" = "Sample_Group",
+                           "conditionTB:Sample_GroupRSTR"="condition:Sample_Group",
+                           "conditionTB"="condition")) %>% 
+  rename(symbol=gene, gene=ensembl_gene_id) 
+```
+
+Fill in missing ENSEMBL ID if available
+
+```{r}
+#Missing ID
+ens.miss <- HIV_neg_results %>% 
+  filter(is.na(gene)) %>% 
+  pull(symbol) %>% unique()
+
+#Get database
+ensembl <- biomaRt::useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+
+#Format gene key
+key <- biomaRt::getBM(attributes=c("ensembl_gene_id", "entrezgene_id", "hgnc_symbol", 
+                                   "gene_biotype"), mart=ensembl) %>% 
+  #Filter to missing gene ID
+  filter(hgnc_symbol %in% ens.miss) %>% 
+  #note if ensembl is in other dataset
+  mutate(in.HIVpos = ifelse(ensembl_gene_id %in% HIV_pos_results$gene, "y","n")) %>% 
+  rename(symbol = hgnc_symbol)
+
+#keep ensembl if in other data set. 
+key.overlap <- key %>% 
+  filter(in.HIVpos == "y") %>% 
+  distinct(ensembl_gene_id, symbol)
+# Else pick a random ensembl as placeholder
+key.miss <- key %>% 
+  filter(in.HIVpos == "n") %>% 
+  group_by(symbol) %>% 
+  slice_head(n=1) %>% 
+  ungroup() %>% 
+  distinct(ensembl_gene_id, symbol) %>% 
+  bind_rows(key.overlap) %>% 
+  #add still missing ones
+  add_row(ensembl_gene_id = "ENSG00000189195", symbol = "KIAA1107") %>% 
+  add_row(ensembl_gene_id = "ENSG00000262180", symbol = "OCLM")
+```
+
+```{r}
+HIV_neg_results <- HIV_neg_results %>% 
+  left_join(key.miss) %>% 
+  mutate(gene = case_when(is.na(gene) ~ ensembl_gene_id, 
+                          TRUE~gene)) %>% 
+  select(-ensembl_gene_id) %>% 
+  #collapse multi-anno
+  group_by(model, gene, variable, pval, FDR) %>% 
+  summarise(symbol = list(unique(symbol)), .groups = "drop")
+```
+
+Save fixed HIV- results
+
+```{r}
+write_csv(HIV_neg_results, 
+          file = "results/HIVneg/RSTR.Mtb.model.results.anno.corrected.csv")
+```
+
+# Overlap of HIV cohorts
+## HIV+/- DEG overlap
+
+RSTR associated DEG
+
+```{r echo=FALSE}
+venn2 <- BIGpicture::plot_venn_genes(list(
+  "HIVpos" = filter(HIV_pos_results,
+                    variable %in% c("Sample_Group","condition:Sample_Group")),
+  "HIVneg" = filter(HIV_neg_results,
+                    variable %in% c("Sample_Group","condition:Sample_Group"))),
+  fdr.cutoff = c(0.2))
+
+venn2$venn
+```
+
+Mtb-dependent DEG
+
+```{r echo=FALSE}
+venn3 <- BIGpicture::plot_venn_genes(list(
+  "HIVpos" = filter(HIV_pos_results, variable == "condition"),
+  "HIVneg" = filter(HIV_neg_results, variable == "condition")),
+  fdr.cutoff = c(0.01, 0.2))
+
+wrap_plots(venn3$venn)
+```
+
+## Determine HIV-specific Mtb-dependent DEGs
+
+```{r}
+fdr.s <- 0.01
+fdr.ns <- 0.2
+
+#HIVpos specific DEG
+HIVpos_signif <- HIV_pos_results %>% 
+  filter(variable == "condition" & FDR < fdr.s) %>% 
+  pull(gene) %>% unique()
+
+HIVneg_nonsignif <- HIV_neg_results %>% 
+  filter(variable == "condition" & FDR > fdr.ns) %>% 
+  pull(gene) %>% unique()
+
+HIVpos_signif_spec <- intersect(HIVpos_signif, HIVneg_nonsignif)
+
+#HIVneg specific DEG
+HIVneg_signif <- HIV_neg_results %>% 
+  filter(variable == "condition" & FDR < fdr.s) %>% 
+  pull(gene) %>% unique()
+
+HIVpos_nonsignif <- model_intr$lme %>% 
+  filter(variable == "condition" & FDR > fdr.ns) %>% 
+  pull(gene) %>% unique()
+
+HIVneg_signif_spec <- intersect(HIVneg_signif, HIVpos_nonsignif)
+```
+
+In total, there are `r length(HIVpos_signif_spec)` HIV+ specific Mtb-dependent DEG and `r length(HIVneg_signif_spec)` HIV- specific Mtb-dependent DEG
+
+Save gene lists
+
+```{r}
+data.frame(HIVpos_only_Mtb_DEG = c(HIVpos_signif_spec, 
+                                   rep(NA, length(HIVneg_signif_spec)-length(HIVpos_signif_spec))),
+           HIVneg_only_Mtb_DEG = HIVneg_signif_spec) %>% 
+  write_csv("results/HIVspecific_DEG.csv", na = "")
+```
+
+### Enrichment of HIV-specific DEG
+#### Hallmark gene sets (H)
+
+```{r h}
+enrich_H <- SEARchways::BIGprofiler(
+  gene_list = list("HIVpos_specific_Mtb"=HIVpos_signif_spec,
+                   "HIVneg_specific_Mtb"=HIVneg_signif_spec),
+  category = "H", ID = "ENSEMBL")
+```
+
+#### Curated gene sets (C2)
+
+```{r c2}
+enrich_C2 <- SEARchways::BIGprofiler(
+  gene_list = list("HIVpos_specific_Mtb"=HIVpos_signif_spec,
+                   "HIVneg_specific_Mtb"=HIVneg_signif_spec),
+  category = "C2", subcategory = "CP", ID = "ENSEMBL") %>% 
+  #Remove unwanted databases
+  filter(!grepl("^WP_|^PID_|^BIOCARTA_", pathway))
+```
+
+#### Gene ontology (C5)
+
+```{r c5}
+enrich_C5 <- SEARchways::BIGprofiler(
+  gene_list = list("HIVpos_specific_Mtb"=HIVpos_signif_spec,
+                   "HIVneg_specific_Mtb"=HIVneg_signif_spec),
+  category = "C5", subcategory = "GO:BP", ID = "ENSEMBL")
+```
+
+#### Immunologic (C7)
+
+```{r c7}
+enrich_C7 <- SEARchways::BIGprofiler(
+  gene_list = list("HIVpos_specific_Mtb"=HIVpos_signif_spec,
+                   "HIVneg_specific_Mtb"=HIVneg_signif_spec),
+  category = "C7", ID = "ENSEMBL")
+```
+
+#### UniProt keyword
+
+Calculated in STRING.
+
+```{r}
+enrich_unip <- read_tsv("results/enrich/HIVneg_enrichment.Keyword.tsv") %>% 
+  mutate(group = "HIVneg_specific_Mtb", size_group = 797,
+         group_in_cat.subcat = 794)
+
+enrich_unip <- read_tsv("results/enrich/HIVpos_enrichment.Keyword.tsv") %>% 
+  mutate(group = "HIVpos_specific_Mtb", size_group = 350,
+         group_in_cat.subcat = 348) %>% 
+  bind_rows(enrich_unip) %>% 
+  #Format to match MSigDB results
+  mutate(gs_cat = "UniProt_kw", gs_subcat = "",
+         pval = NA, qvalue = NA,
+         size_cat.subcat = NA) %>% 
+  rename(pathway = "term description", FDR = "false discovery rate",
+         size_pathway = "background gene count", 
+         group_in_pathway = "observed gene count",
+         genes = "matching proteins in your network (labels)") %>% 
+  mutate(`k/K` = group_in_pathway/size_pathway) %>% 
+  select(all_of(colnames(enrich_H))) %>% 
+  #format genes to list
+  mutate(genes = strsplit(genes, split=","))
+```
+
+#### Summarise enrichment results
+
+```{r}
+save(enrich_H, enrich_C2, enrich_C5, enrich_C7, enrich_unip,
+     file = "results/enrich/HIVpos_specific_hypergeo.RData")
+```
+
+```{r echo=FALSE}
+enrich_all <- bind_rows(enrich_H, enrich_C2, enrich_C5, 
+                        enrich_C7, enrich_unip) %>%
+  mutate(gs_cat = factor(gs_cat), group = factor(group))
+
+temp <- enrich_all %>% 
+  filter(FDR < 0.3 & group_in_pathway > 1) %>% 
+  group_by(group, size_group, gs_cat, .drop = FALSE) %>%
+  count(group, size_group, gs_cat) %>% 
+  rename(`FDR < 0.3`=n)
+
+temp2 <- enrich_all %>% 
+  filter(FDR < 0.2 & group_in_pathway > 1) %>% 
+  group_by(group, size_group, gs_cat, .drop = FALSE) %>%
+  count(group, size_group, gs_cat) %>% 
+  rename(`FDR < 0.2`=n)
+
+temp3 <- enrich_all %>% 
+  filter(FDR < 0.1 & group_in_pathway > 1) %>% 
+  group_by(group, size_group, gs_cat, .drop = FALSE) %>%
+  count(group, size_group, gs_cat) %>% 
+  rename(`FDR < 0.1`=n)
+
+enrich_all %>% 
+  filter(FDR < 0.02 & group_in_pathway > 1) %>% 
+  group_by(group, size_group, gs_cat, .drop = FALSE) %>%
+  count(group, size_group, gs_cat) %>%   
+  rename(`FDR < 0.02`=n) %>% 
+  full_join(temp3) %>% 
+  full_join(temp2) %>% 
+  full_join(temp) %>%
+  arrange(group, gs_cat) %>% 
+  select(group, size_group, everything()) %>% 
+  
+kable() %>%
+kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% 
+  collapse_rows(1:3)
+```
+
+Viewing just C2 and UniProt for brevity. FDR < 0.3 and overlap > 1
+
+```{r}
+bind_rows(enrich_C2, enrich_unip) %>%
+  filter(FDR < 0.3 & group_in_pathway > 1) %>% 
+  group_by(group) %>% 
+  slice_min(FDR, n=12) %>% 
+  select(group, size_group, gs_cat, pathway, group_in_pathway, `k/K`, FDR) %>% 
+  arrange(group, gs_cat) %>%
+
+kable() %>%
+kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% 
+  collapse_rows(c(1:3))
+```
+
+# R session
+
+```{r}
+sessionInfo()
+```

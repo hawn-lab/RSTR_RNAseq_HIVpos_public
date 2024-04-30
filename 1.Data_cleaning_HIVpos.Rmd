@@ -1,0 +1,459 @@
+---
+title: "RNA-seq data cleaning"
+subtitle: "Uganda HIV+ : TB-induced RSTR vs LTBI"
+author: "Basilin Benson basilinb@uw.edu"
+date: "version `r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float:
+      collapsed: no
+  pdf_document:
+    toc: yes
+editor_options:
+  chunk_output_type: console
+header-includes:
+ \usepackage{float}
+---
+# Background
+
+The purpose of this workflow is to complete basic data cleaning of metadata and RNA-seq libraries. This includes 1) removing low coverage libraries, 2) filtering rare genes, 3) removing outlying libraries and duplicates, and 4) normalizing for RNA composition. 
+
+# Setup
+Load packages
+
+```{r setup, message=FALSE, warning=FALSE}
+# Empirical analysis of digital gene expression data
+## Data normalization
+library(edgeR)
+library(limma)
+
+# Data manipulation and figures
+library(tidyverse)
+library(openxlsx)
+  # Modify ggplot figures to non-overlapping text labels
+  library(ggrepel)
+  # Modify ggplot data order within facets
+  library(drlib)
+  # Plot log scales
+  library(scales)
+  #Multi-panel figures
+  library(patchwork)
+  #Custom plots
+  library(BIGpicture)
+
+# reference genome
+#don't load due to conflicts with tidyverse
+# library(biomaRt)
+
+# Print pretty table to knit file
+library(knitr)
+library(kableExtra)
+  options(knitr.kable.NA = '')
+  opts_chunk$set(fig.pos = 'H')
+
+#Create 'not in' operator
+`%notin%` <- Negate(`%in%`)
+# select <- dplyr::select
+# rename <- dplyr::rename
+# filter <- dplyr::filter
+# distinct <- dplyr::distinct
+# mutate <- dplyr::mutate
+```
+
+Create Directory Structure
+```{r dir}
+dir.create("results",showWarnings = FALSE,recursive = FALSE)
+dir.create("fig",showWarnings = FALSE,recursive = FALSE)
+```
+
+Set seed
+
+```{r}
+set.seed(4389)
+```
+
+# Read in and format data 
+## Metadata
+
+```{r message=FALSE}
+meta <- read_csv("data_raw/2021.03.10RSTR_Hawn_metadata.csv") %>% 
+  filter(HIVSTAT_CURRENT == "Y")
+```
+
+Add CD4 count data
+
+```{r}
+cd4 <- read.xlsx("data_raw/RSTR_LTBI metadata_HIV_pos 062111.xlsx") %>% 
+  separate(libID, into = c("RS_SUB_ACCESSION_NO"), 
+           extra = "drop") %>% 
+  mutate(CD4 = as.numeric(CD4_RESULT1)) %>% 
+  distinct(RS_SUB_ACCESSION_NO, CD4) %>% 
+  #add cutoff groups
+  mutate(CD4_color = case_when(CD4 <= 200 ~"<200",
+                               CD4 <= 1000 ~ "between 200 and 1000",
+                               CD4 > 1000 ~ ">1000"))
+
+meta <- meta %>% 
+  left_join(cd4)
+```
+
+## Counts: HIV+
+
+```{r}
+count_hiv_pos <- read_tsv("data_raw/rstr-hiv-pos.featurecounts.paired.tsv", skip=1) %>% 
+  #Remove gene info
+  select(-c(Chr:Length)) %>% 
+  #Clean names
+  rename(ensembl_gene_id = Geneid) %>% 
+  rename_all(~gsub("^/home/ec2-user/project/rstr_results/bam_filter/|_filter.bam$", "", .)) %>% 
+  rename_all(~gsub("-", "_", .)) %>% 
+  rename_all(~gsub("Media", "MEDIA", .)) %>% 
+  #drop 0 rows
+  filter_if(is.numeric, any_vars(.>0))
+```
+
+```{r}
+count.all <- count_hiv_pos %>%  
+  #replace NA with 0
+  replace(is.na(.), 0) %>% 
+  #arrange cols
+  select(ensembl_gene_id, sort(colnames(count_hiv_pos)))
+```
+
+## Metadata
+
+Combine metrics with donor metadata
+
+```{r message=FALSE}
+meta.all <-  read_csv("data_raw/rstr.HIVpos.cleaning.metrics.csv") %>%  
+  #Add condition variable
+  mutate(libID=gsub("-", "_", toupper(libID)),
+         name=gsub("^[0-9]{1,2}_", "", libID)) %>% 
+  separate(name, into=c("RSID","condition"), sep="_") %>% 
+  #Add donor metadata
+  left_join(meta,
+            by=c("RSID"="RS_SUB_ACCESSION_NO")) %>% 
+  #Remove failed lib
+  filter(libID %in% colnames(count.all)) %>% 
+  arrange(libID) %>% mutate(batch = "HIV pos")
+```
+
+
+Check order
+
+```{r}
+identical(colnames(count.all)[-1], meta.all$libID)
+```
+
+
+# Data cleaning
+Set cutoffs
+
+```{r}
+#Provide file basename
+#This will be appended to the start of all file names saved to the disk
+basename <- "RSTR.HIV"
+
+#List main variables of interest
+#Will be used to visualize data in tables and plots
+#If > 2 variables provided, plots are not colored by variables
+vars_of_interest <- c("condition","Sample_Group","HIVSTAT_CURRENT")
+
+# Define cutoffs
+#Median CV coverage MAXIMUM
+CV.cut <- 1
+#Alignment percentage with duplicates MINIMUM
+align.cut <- 0.95
+#Total sequences MINIMUM
+count.cut <- 1E6
+```
+
+## Filter protein coding genes
+
+Filter gene key to protein coding (pc) genes that occur in the count data set.
+
+```{r ensembl}
+#Get database
+ensembl <- biomaRt::useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+
+#Format gene key
+key <- biomaRt::getBM(attributes=c("ensembl_gene_id", "entrezgene_id", "hgnc_symbol", 
+                                        "gene_biotype", "chromosome_name",
+                                        "start_position", "end_position"), mart=ensembl) %>% 
+  #Filter protein coding genes
+  filter(gene_biotype == "protein_coding")
+
+key.filter <- key %>% 
+  #Filter protein coding genes in count table
+  filter(ensembl_gene_id %in% count.all$ensembl_gene_id) %>% 
+  #collapse multiannotations.
+  group_by(ensembl_gene_id, hgnc_symbol, gene_biotype, 
+           chromosome_name, start_position, end_position) %>% 
+  summarise(entrezgene_id = list(unique(entrezgene_id)), .groups = "drop") %>% 
+  group_by(ensembl_gene_id, entrezgene_id, gene_biotype, 
+           chromosome_name, start_position, end_position) %>% 
+  summarise(symbol = list(unique(hgnc_symbol)), .groups = "drop") %>% 
+  arrange(ensembl_gene_id)
+```
+
+Filter the count data to pc genes as well.
+
+```{r message=FALSE, echo=FALSE}
+count.all.pc <- count.all %>% 
+  filter(ensembl_gene_id %in% key.filter$ensembl_gene_id) %>% 
+  arrange(ensembl_gene_id)
+```
+
+This removes `r nrow(count.all)-nrow(count.all.pc)` genes.
+
+#### Check genes
+
+All genes in count and key in the same order?
+
+```{r echo=FALSE}
+identical(count.all.pc$ensembl_gene_id, key.filter$ensembl_gene_id)
+```
+
+
+## Assess library coverage
+#### Median CV coverage vs. mapped duplicate reads
+
+Compare the median coefficient of variation (CV) coverage (`median_cv_coverage`) and percent alignment of reads with duplicates (`mapped_reads_w_dups`). Ideally, you want libraries with LOW median CV coverage and HIGH percent aligned duplicates, indicating low variability in coverage over the length of genes and high coverage across the genome, respectively. 
+
+Plot CV coverage vs alignment. Samples outside the cutoff assigned above are labeled with sampID.
+
+```{r cv.dups, echo=FALSE, warning=FALSE}
+#Color/shapes based on number of variables of interest
+ggplot(meta.all,
+                  aes(MEDIAN_CV_COVERAGE, PCT_PF_ALIGNED)) +
+           geom_point(aes_string(color="condition",
+                                 shape=vars_of_interest[1]),
+                      size=3) +
+  # Add cutoff lines
+  geom_hline(yintercept=align.cut, linetype=2) +
+  geom_vline(xintercept=CV.cut, linetype=2) +
+  #Beautify
+  theme_classic() +
+  theme(legend.position = "bottom") +
+  labs(x="Median CV coverage", y="Mapped reads with duplicates") +
+  lims(x=c(0,1.4), y=c(0,1))
+```
+
+
+```{r cv.dups2, echo=FALSE, warning=FALSE}
+#Color/shapes based on number of variables of interest
+ggplot(meta.all,
+                  aes(MEDIAN_CV_COVERAGE, PCT_PF_ALIGNED)) +
+           geom_point(aes_string(color="condition",
+                                 shape=vars_of_interest[1]),
+                      size=3) +
+  #Label points outside cutoffs
+  geom_text_repel(data=filter(meta.all,
+                            MEDIAN_CV_COVERAGE > CV.cut | 
+                            PCT_PF_ALIGNED < align.cut),
+            aes(label=RSID), show.legend = FALSE, max.overlaps = 20, min.segment.length = 0) +
+  # Add cutoff lines
+  geom_vline(xintercept=CV.cut, linetype=2) +
+  #Beautify
+  theme_classic() +
+  theme(legend.position = "bottom") +
+  labs(x="Median CV coverage", y="Mapped reads with duplicates") 
+```
+
+
+Final table of samples by group and condition
+```{r echo=FALSE}
+meta.all %>% 
+  group_by( Sample_Group, condition) %>%
+  tally() %>% 
+  
+  kable(align="l",caption="Total libraries") %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% 
+  collapse_rows(1:2, valign="top")
+```
+
+#### Total aligned counts
+
+Assess aligned counts per library. Higher counts indicate high coverage and are preferred. 
+
+Plot total counts per library. Libraries outside cutoffs are labeled as "questionable". The minimum total sequences cutoff set above is indicated by a horizontal line.
+
+```{r tot.seqs, echo=FALSE, fig.width=8.5, message=FALSE}
+count.all.pc %>% 
+  pivot_longer(-ensembl_gene_id, names_to = "libID") %>% 
+  group_by(libID) %>% 
+  summarise(tot = sum(value, na.rm=TRUE)) %>% 
+  left_join(meta.all) %>% 
+
+  ggplot(aes(x=reorder_within(RSID, by=tot,within = batch), 
+           y=tot, fill=condition))  +
+    geom_col() +
+    # Facet by variable of interest
+    facet_grid(~condition, scales="free_x", space="free") +
+    # Add cutoff line
+    geom_hline(yintercept = count.cut) +
+    facet_wrap(~condition, scales="free_x") +
+    # Beautify
+    theme_classic() +
+    theme(axis.text.x = element_text(size=rel(0.75),
+                                     angle = 90, hjust = 1),
+        legend.position = "none") +
+    labs(x="RSID", y="Total aligned counts\n(Log scale)", fill="") +
+    scale_x_reordered() +
+    scale_y_continuous(trans = 'log10',
+    breaks = trans_breaks("log10", function(x) 10^x),
+    labels = trans_format("log10", math_format(10^.x)))
+```
+
+## Filter by library coverage
+
+All libraries have sufficient sequences for analysis. Some libraries have questionable CV coverage and these will be further assessed in PCA.
+
+## Assess PCA outliers
+
+Visualize PCA outliers defined as any library with PC1 and/or PC2 values greater than 3 standard deviations away from the PC mean of their respective condition group.
+
+```{r PCA.outlier, echo=FALSE, message=FALSE}
+pca.outlier <- plot_pca(count.all.pc, 
+                        meta = meta.all,
+                        vars = c(vars_of_interest,"outlier"),
+                        scale = TRUE,
+                        transform_logCPM = TRUE,
+                        outlier_sd = 3)
+
+wrap_plots(pca.outlier, ncol = 2)
+
+wrap_plots(pca.outlier, ncol = 2) %>% 
+  ggsave(filename ="fig/PCA/PCA_HIVpos_unnormalized.png",
+         width=9, height=9)
+```
+
+While only 1 outlier exists, the next most outlying sample is from the same donor. Given this and the paired samples design, this entire donor will be removed.
+
+```{r}
+plot_pca(count.all.pc, 
+         meta = meta.all,
+         vars = "outlier",
+         scale = TRUE,
+         transform_logCPM = TRUE,
+         outlier_sd = 2)
+```
+                        
+## Filter PCA outliers
+
+Both outlier are from the same donor. Thus, remove this donor.
+
+```{r}
+meta.filter <- meta.all %>% filter(RSID != "RS103146")
+
+count.filter <- count.all.pc %>% 
+  select(ensembl_gene_id, all_of(meta.filter$libID))
+```
+
+## Filter rare genes
+
+Create DGEList object.
+
+```{r dgelist, echo=FALSE}
+dat <- DGEList(
+  #count table. move gene names to column names
+  counts=as.matrix(column_to_rownames(count.filter,
+                                      "ensembl_gene_id")),
+  #metadata
+  samples=meta.filter,
+  #keep genes in count table
+  genes=key.filter)
+```
+
+Mean Variance plot
+```{r voom1, echo=FALSE, warning=FALSE}
+
+MV.plot1<-BIGpicture::plot_mv(dat,design = ~ condition)
+
+```
+
+
+The raw gene sets contain highly variable, low abundance/rare genes (left side of plots). These genes will be filtered at 1 CPM in at least 3 samples. Given the difference in sample size for HIV+ and HIV- data sets, a minimum number of samples is used instead of percentage of samples. 
+
+```{r}
+
+dat.abund <- RNAetc::filter_rare(dat = dat,
+                                 min.CPM = 0.8,
+                                 min.sample = 2,
+                                 gene.var = "ensembl_gene_id")
+
+MV.plot2<-BIGpicture::plot_mv(dat.abund,design = ~ condition)
+
+MV.plot1 + MV.plot2
+```
+
+
+## Normalize for RNA composition
+
+Calculate factors to scale library sizes.
+
+```{r norm}
+dat.abund.norm <- calcNormFactors(dat.abund)
+```
+
+## Normalize with voom
+
+```{r voom3}
+dat.abund.norm.voom <- voomWithQualityWeights(
+                           dat.abund.norm,
+                           design=model.matrix(~ condition,
+                                 data=dat.abund.norm$samples),
+                           plot=TRUE)
+```
+
+## Final data
+### Summarize samples
+
+Final table of samples by group and condition
+
+```{r echo=FALSE}
+dat.abund.norm.voom$targets %>% 
+  group_by( Sample_Group, condition) %>%
+  tally() %>% 
+  
+  kable(align="l",caption="Total libraries") %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% 
+  collapse_rows(1:2, valign="top")
+```
+
+### PCA
+
+```{r PCA.final, echo=FALSE, warning=FALSE, message=FALSE}
+pca.final <- plot_pca(dat.abund.norm.voom,
+                        vars = c(vars_of_interest,"outlier"),
+                        scale = TRUE,
+                        outlier_sd = 3)
+
+wrap_plots(pca.final, ncol = 2)
+
+wrap_plots(pca.final, ncol = 2) %>% 
+  ggsave(filename ="fig/PCA/PCA_HIVpos_normalized.png",
+       width=9, height=9)
+```
+
+### Save final data
+
+Write as RData
+
+```{r}
+#Rename to short form
+dat <- dat.abund.norm
+dat.voom <- dat.abund.norm.voom
+
+save(dat,
+     file="data_clean/HIV_pos_counts.RData")
+save(dat.voom, 
+     file="data_clean/HIV_pos_voom.RData")
+```
+
+# R session
+
+```{r}
+sessionInfo()
+```

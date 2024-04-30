@@ -1,0 +1,588 @@
+---
+title: "RNA-seq differential gene expression"
+subtitle: "Uganda: HIV+ TB-induced RSTR vs LTBI"
+author: "Basilin Benson basilinb@uw.edu & Kim Dill-McFarland kadm@uw.edu"
+date: "version `r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float:
+      collapsed: no
+editor_options:
+  chunk_output_type: console
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(fig.height=4, fig.width = 8.5, echo=FALSE,message=FALSE, warning=FALSE) 
+
+```
+
+# Background
+
+The purpose of this workflow is to identify TB-induced differentially expressed genes (DEG) in HIV+ individuals and compare these DEGs to those identified separately for HIV- individuals.
+
+# Setup
+Load packages
+
+```{r message=FALSE, warning=FALSE}
+# Data manipulation and figures
+library(tidyverse)
+    # Multi-panel figures for ggplot
+    library(patchwork)
+    ## Add P-values to ggplots
+    library(ggpubr)
+    #Custom figures
+    library(BIGpicture)
+
+#Linear modeling
+library(kimma)
+
+#Enrichment
+library(SEARchways)
+
+# Print tty table to knit file
+library(knitr)
+library(kableExtra)
+
+`%notin%` <- Negate(`%in%`)
+```
+
+Set seed
+
+```{r}
+set.seed(4389)
+```
+
+# Load data
+
+```{r message=FALSE, warning=FALSE}
+#Load data
+load("data_clean/HIV_pos_voom.RData")
+```
+
+# Data exploration
+## Sample number
+
+```{r echo=FALSE, message=FALSE}
+dat.voom$targets %>% 
+  dplyr::count(Sample_Group, condition) %>% 
+  
+kable() %>%
+kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+## Co-variates
+
+```{r echo=FALSE, warning=FALSE}
+plot1 <- dat.voom$targets %>% 
+  distinct(RSID, Sample_Group, KCHCA_AGE_YR_CURRENT) %>% 
+
+  ggplot(aes(x=Sample_Group, y=KCHCA_AGE_YR_CURRENT, color=Sample_Group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(height=0,width=0.2, size=3) +
+  stat_compare_means(method="wilcox.test") +
+  theme_classic() +
+  theme(legend.position="none") +
+  labs(x="")
+  
+sex.p <- table(dat.voom$targets$Sample_Group, dat.voom$targets$M0_KCVSEX) %>% 
+  chisq.test()
+
+plot2<-dat.voom$targets %>% 
+  group_by(Sample_Group, M0_KCVSEX) %>% 
+  tally() %>% 
+  
+  ggplot(aes(x=Sample_Group, y=n, fill=M0_KCVSEX)) +
+  geom_bar(position="fill", stat="identity") +
+  theme_classic() +
+  labs(y="Proportion", x="",
+       title=paste("M0_KCVSEX\nChi-squared = ", round(sex.p$p.value,3), sep="")) +
+  scale_fill_manual(values=c("#f1a340","#998ec3"))
+
+plot1 + plot2
+```
+
+## PCA
+
+Several variables of interest are shown here. Colors are consistent in PCA and dendrograms. To explore all variables, see <https://kdillmcfarland.shinyapps.io/LamM_UC_RNAseq_PCA3/>
+
+```{r message=FALSE, fig.height=8}
+vars.to.plot <- c("Sample_Group", "condition",
+                  "KCHCA_AGE_YR_CURRENT", "M0_KCVSEX",
+                  "CD4_color")
+#make PCA
+plot_pca(dat.voom, vars = vars.to.plot) %>% 
+  wrap_plots(., ncol=2)
+```
+
+
+# Linear modeling
+## Run models
+
+Base model `~ condition*Sample_Group + (1|FULLIDNO)`
+
+```{r eval=FALSE}
+model_intr <-  kimma::kmFit(dat = dat.voom, 
+          model = "~ condition*Sample_Group + (1|FULLIDNO)", 
+          patientID = "FULLIDNO",
+          use_weights = TRUE,
+          metrics = TRUE,
+          run_lme = TRUE,
+          run_contrast = TRUE,
+          contrast_var = "condition:Sample_Group")
+```
+
+Add age and Sex as covariates `~ condition*Sample_Group + age + sex + (1|FULLIDNO)`
+
+```{r eval=FALSE}
+model_intr_cov <- kimma::kmFit(dat = dat.voom, 
+          model = "~ condition*Sample_Group + KCHCA_AGE_YR_CURRENT + M0_KCVSEX + (1|FULLIDNO)", 
+          patientID = "FULLIDNO",
+          use_weights = TRUE,
+          metrics = TRUE,
+          run_lme = TRUE,
+          run_contrast = TRUE,
+          contrast_var = "condition:Sample_Group")
+```
+
+Add CD4 count as covariate `~ condition*Sample_Group + CD4 + (1|FULLIDNO)`
+
+```{r eval=FALSE}
+model_intr_cd4 <- kimma::kmFit(dat = dat.voom, 
+          model = "~ condition*Sample_Group + CD4 + (1|FULLIDNO)", 
+          patientID = "FULLIDNO",
+          use_weights = TRUE,
+          metrics = TRUE,
+          run_lme = TRUE,
+          run_contrast = TRUE,
+          contrast_var = "condition:Sample_Group")
+```
+
+Add TB risk as covariate `~ condition*Sample_Group + RISK_SCORE + (1|FULLIDNO)`
+
+```{r eval=FALSE}
+model_intr_risk <- kimma::kmFit(dat = dat.voom, 
+          model = "~ condition*Sample_Group + RISK_SCORE + (1|FULLIDNO)", 
+          patientID = "FULLIDNO",
+          use_weights = TRUE,
+          metrics = TRUE,
+          run_lme = TRUE)
+```
+
+```{r eval=FALSE, include=FALSE}
+save(model_intr, model_intr_cov, model_intr_cd4, model_intr_risk,
+     file = "results/model_fitting/HIVpos_models.RData")
+```
+
+```{r include=FALSE}
+load("results/model_fitting/HIVpos_models.RData")
+```
+
+## Assess co-variates
+
+Age and sex do not improve fit for the majority of genes. These covariates are significant for few genes and also result in fewer RSTR significant genes, likely as a result of reduced power in the more complex model with this small data set.
+
+```{r}
+fit1 <- BIGpicture::plot_fit2(model_result=model_intr, x="lme",
+                              model_result_y= model_intr_cov,  y="lme",
+                              x_label = "Base model", y_label = "+Age+Sex",
+                              metrics=c("AIC","BIC")) +
+  ggtitle("+/- age and sex")
+fit1
+ggsave("fig/model_fit/AIC_BIC_agesex.png", plot = fit1,
+       width=4, height=5)
+```
+
+```{r}
+kimma::summarise_kmFit(model_intr$lme) %>% 
+  kable() %>%
+  kable_styling(bootstrap_options = "striped", full_width=FALSE)
+
+kimma::summarise_kmFit(model_intr_cov$lme) %>% 
+  kable() %>%
+  kable_styling(bootstrap_options = "striped", full_width=FALSE)
+```
+
+CD4 counts do not improve model fit for any gene, and this covariate is significant for very few genes.
+
+```{r}
+fit2 <- BIGpicture::plot_fit2(model_result=model_intr, x="lme",
+                              model_result_y= model_intr_cd4,  y="lme",
+                              x_label = "Base model", y_label = "+CD4",
+                              metrics=c("AIC","BIC")) +
+  ggtitle("+/- CD4")
+fit2
+ggsave("fig/model_fit/AIC_BIC_cd4.png", plot = fit2,
+       width=4, height=5)
+```
+
+```{r}
+kimma::summarise_kmFit(model_intr_cd4$lme) %>% 
+  kable() %>%
+  kable_styling(bootstrap_options = "striped",
+                full_width=FALSE)
+```
+
+TB risk score does not improve model fit for the majority of genes, and this covariate is significant for very few genes.
+
+```{r}
+fit3 <- BIGpicture::plot_fit2(model_result=model_intr, x="lme",
+                              model_result_y= model_intr_risk,  y="lme",
+                              x_label = "Base model", y_label = "+Risk",
+                              metrics=c("AIC","BIC")) +
+  ggtitle("+/- Risk score")
+fit3
+ggsave("fig/model_fit/AIC_BIC_risk.png", plot = fit3,
+       width=4, height=5)
+```
+
+```{r}
+kimma::summarise_kmFit(model_intr_risk$lme) %>% 
+  kable() %>%
+  kable_styling(bootstrap_options = "striped",
+                full_width=FALSE)
+```
+
+Given the above results and small sample size, no co-variates will be included in the final model.
+
+## Significant genes
+
+The final model is `~ condition*Sample_Group + (1|FULLIDNO)`
+
+No interaction significant genes are also significant for the main RSTR term (Sample_Group). Thus, both gene lists may be assessed separately.
+
+```{r echo=FALSE}
+venn1 <- plot_venn_genes(model_intr, models = "lme",
+                fdr.cutoff = c(0.01, 0.2))
+
+wrap_plots(venn1$venn)
+```
+
+Significant RSTR genes include:
+
+```{r echo=FALSE}
+model_intr$lme %>% 
+  filter(variable %in% c("condition:Sample_Group","Sample_Group") & 
+           FDR < 0.2) %>%
+  left_join(dat.voom$genes, by=c("gene"="ensembl_gene_id")) %>% 
+  dplyr::select(symbol,variable,FDR) %>% 
+  
+  arrange(variable,FDR) %>% 
+kable() %>%
+kable_styling(bootstrap_options = "striped", full_width=FALSE)
+```
+
+## Pairwise contrasts
+
+Because an interaction model was used, re-assess pairwise contrasts for just interaction term significant genes.
+
+```{r eval = FALSE}
+degs_ensembl <- model_intr$lme %>% 
+  filter(variable %in% c("condition:Sample_Group","Sample_Group") & FDR < 0.2) %>% 
+  pull(gene)
+
+model_con <-  kimma::kmFit(dat = dat.voom, 
+          model = "~ condition*Sample_Group + (1|FULLIDNO)", 
+          patientID = "FULLIDNO",
+          use_weights = TRUE,
+          metrics = TRUE,
+          run.lm = TRUE,
+          run_lme = TRUE,
+          run_contrast = TRUE,
+          subset.genes = degs_ensembl,
+          contrast_var = "condition:Sample_Group")
+
+save(model_con, 
+     file = "results/model_fitting/HIVpos_con_models.RData")
+```
+
+```{r include=FALSE}
+load("results/model_fitting/HIVpos_con_models.RData")
+```
+
+Also filter both contrast results to just the pairs of interest.
+
+```{r}
+contr_OI <- data.frame(
+  contrast_ref = c("MEDIA LTBI","MEDIA RSTR",
+                   "MEDIA LTBI", "TB LTBI"),
+  contrast_lvl = c("TB LTBI", "TB RSTR",
+                   "MEDIA RSTR", "TB RSTR")
+)
+
+model_con$lm.contrast <- model_con$lm.contrast %>% 
+  inner_join(contr_OI)
+
+model_con$lme.contrast <- model_con$lme.contrast %>% 
+  inner_join(contr_OI)
+
+model_intr$lme.contrast <- model_intr$lme.contrast %>% 
+  inner_join(contr_OI)
+```
+
+## Save final model
+
+Add HGNC symbol to results.
+
+```{r}
+gene.key <- dat.voom$genes %>% 
+  select(ensembl_gene_id, symbol) %>% 
+  rename(gene = ensembl_gene_id)
+
+model_intr$lme <- model_intr$lme %>% 
+  left_join(gene.key)
+
+model_intr$lme.contrast <- model_intr$lme.contrast %>% 
+  left_join(gene.key)
+
+model_con$lm <- model_con$lm %>% 
+  left_join(gene.key)
+
+model_con$lm.contrast <- model_con$lm.contrast %>% 
+  left_join(gene.key)
+
+model_con$lme <- model_con$lme %>% 
+  left_join(gene.key)
+
+model_con$lme.contrast <- model_con$lme.contrast %>% 
+  left_join(gene.key)
+```
+
+```{r}
+save(model_intr, model_con, file = "results/HIVpos_lme.RData")
+```
+
+# DEG enrichment
+
+```{r}
+deg_rstr <- model_intr$lme %>% 
+  filter(FDR < 0.2 & variable == "Sample_Group") %>% 
+  pull(gene)
+deg_int <- model_intr$lme %>% 
+  filter(FDR < 0.2 & variable == "condition:Sample_Group") %>% 
+  pull(gene)
+deg_all <- unique(c(deg_rstr, deg_int))
+
+#format for enrich
+gene_list <- list(
+  "RSTR_DEG" = deg_rstr,
+  "Interaction_DEG" = deg_int,
+  "All_DEG" = deg_all
+)
+```
+
+#### Hallmark gene sets (H)
+
+```{r h}
+enrich_H <- SEARchways::BIGprofiler(
+  gene_list = gene_list, ID = "ENSEMBL",
+  category = "H")
+```
+
+#### Curated gene sets (C2)
+
+```{r c2}
+enrich_C2 <- SEARchways::BIGprofiler(
+  gene_list = gene_list, ID = "ENSEMBL",
+  category = "C2", subcategory = "CP") %>% 
+  #Remove unwanted databases
+  filter(!grepl("^WP_|^PID_|^BIOCARTA_", pathway))
+```
+
+#### Gene ontology (C5)
+
+```{r c5}
+enrich_C5 <- SEARchways::BIGprofiler(
+  gene_list = gene_list, ID = "ENSEMBL",
+  category = "C5", subcategory = "GO:BP")
+```
+
+#### Immunologic (C7)
+
+```{r c7}
+enrich_C7 <- SEARchways::BIGprofiler(
+  gene_list = gene_list, ID = "ENSEMBL",
+  category = "C7")
+```
+
+#### UniProt keyword
+
+Calculated in STRING. No terms significant.
+
+#### Summarise enrichment results
+
+```{r}
+save(enrich_H, enrich_C2, enrich_C5, enrich_C7,
+     file = "results/enrich/RSTR_DEG_hypergeo.RData")
+```
+
+```{r}
+temp <- bind_rows(enrich_H, enrich_C2, enrich_C5, enrich_C7) %>%
+  mutate(gs_cat = factor(gs_cat), group = factor(group)) %>% 
+  filter(FDR < 0.3 & group_in_pathway > 1) %>% 
+  group_by(group, size_group, gs_cat, .drop = FALSE) %>%
+  count(group, gs_cat) %>% 
+  rename(`FDR < 0.3`=n)
+
+temp2 <- bind_rows(enrich_H, enrich_C2, enrich_C5, enrich_C7) %>%
+  mutate(gs_cat = factor(gs_cat), group = factor(group)) %>% 
+  filter(FDR < 0.2 & group_in_pathway > 1) %>% 
+  group_by(group, gs_cat, .drop = FALSE) %>%
+  count(group, gs_cat) %>% 
+  rename(`FDR < 0.2`=n)
+
+temp3 <- bind_rows(enrich_H, enrich_C2, enrich_C5, enrich_C7) %>%
+  mutate(gs_cat = factor(gs_cat), group = factor(group)) %>% 
+  filter(FDR < 0.1 & group_in_pathway > 1) %>% 
+  group_by(group, gs_cat, .drop = FALSE) %>%
+  count(group, gs_cat) %>% 
+  rename(`FDR < 0.1`=n)
+
+bind_rows(enrich_H, enrich_C2, enrich_C5, enrich_C7) %>%
+  mutate(gs_cat = factor(gs_cat), group = factor(group)) %>% 
+  filter(FDR < 0.02 & group_in_pathway > 1) %>% 
+  group_by(group, gs_cat, .drop = FALSE) %>%
+  count(group, gs_cat) %>%   
+  rename(`FDR < 0.02`=n) %>% 
+  full_join(temp3) %>%
+  full_join(temp2) %>% 
+  full_join(temp) %>% 
+  arrange(group, gs_cat) %>% 
+  select(group, size_group, gs_cat, everything()) %>% 
+
+kable() %>%
+kable_styling(bootstrap_options = "striped", full_width = FALSE)%>% 
+  collapse_rows(1:2)
+```
+
+Viewing just C2 for brevity. FDR < 0.3 and overlap > 1
+
+```{r echo=FALSE}
+enrich_C2 %>%
+  filter(FDR < 0.3 & group_in_pathway > 1) %>% 
+  filter(group == "All_DEG") %>% 
+  select(group, size_group, gs_cat, pathway, group_in_pathway, `k/K`, FDR) %>% 
+  arrange(group, gs_cat, FDR) %>% 
+  
+kable(caption = "All RSTR and interaction DEG") %>%
+kable_styling(bootstrap_options = "striped", full_width = FALSE)%>% 
+  collapse_rows(c(1:3))
+```
+
+```{r echo=FALSE}
+enrich_C2 %>%
+  filter(FDR < 0.3 & group_in_pathway > 1) %>% 
+  filter(group == "RSTR_DEG") %>% 
+  select(group, size_group, gs_cat, pathway, group_in_pathway, `k/K`, FDR) %>% 
+  arrange(group, gs_cat) %>% 
+  
+kable(caption = "RSTR DEG") %>%
+kable_styling(bootstrap_options = "striped", 
+              full_width = FALSE)%>% 
+  collapse_rows(c(1:3))
+```
+
+```{r echo=FALSE}
+enrich_C2 %>%
+  filter(FDR < 0.3 & group_in_pathway > 1) %>% 
+  filter(group == "Interaction_DEG") %>% 
+  select( group, gs_cat, size_group, pathway, group_in_pathway, `k/K`, FDR) %>% 
+  arrange(group, gs_cat) %>% 
+  
+kable(caption = "Iteraction DEG") %>%
+kable_styling(bootstrap_options = "striped", full_width = FALSE)%>% 
+  collapse_rows(c(1:3))
+```
+
+# Gene set enrichment analysis (GSEA)
+
+Extract fold change estimates
+
+```{r}
+#Use ensemble since some missing symbol
+FC.all <- model_intr$lme.contrast %>% 
+  mutate(group = paste(contrast_lvl,contrast_ref, sep="-")) %>% 
+  select(group, gene, estimate)
+```
+
+#### Hallmark gene sets (H)
+
+Table shows RSTR significant (FDR < 0.1) normalized enrichment scores in 4 contrasts of interest. If `NA` in summary table, term was not significant in that contrast (FDR > 0.1).
+
+```{r warning=FALSE}
+GSEA_H <- SEARchways::BIGsea(gene_df = FC.all,
+                             category = "H", ID = "ENSEMBL")
+
+save(GSEA_H, file="results/enrich/HIVpos_GSEA.RData")
+```
+
+```{r}
+gsea_pw <- GSEA_H %>% 
+  filter(FDR < 0.1 & group %in% c("MEDIA RSTR-MEDIA LTBI",
+                                  "TB RSTR-TB LTBI")) %>% 
+  pull(pathway)
+
+GSEA_H %>% 
+  filter(FDR < 0.1 & pathway %in% gsea_pw) %>% 
+  select(group, pathway, NES) %>% 
+  arrange(group) %>% 
+  pivot_wider(names_from = group, values_from = NES) %>% 
+  kable() %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)%>% 
+  collapse_rows(1:3)
+```
+
+# DEG association with covariates
+
+Because the simplest model was chosen, we further assess DEGs for differences in covariates not included in the final model.
+
+Most importantly, TB risk score since it differs between RSTR and LTBI.
+
+```{r echo=FALSE}
+dat.voom$targets %>%
+  ggplot(aes(x=Sample_Group, y=RISK_SCORE)) +
+  geom_violin() +
+  geom_jitter(width=0.2, height = 0) +
+  stat_summary(geom = "point", fun = "mean", col = "red",
+               size = 3, shape = "square") +
+  theme_classic() +
+  stat_compare_means(method = "t.test")
+```
+
+```{r}
+model_riskM <- kimma::kmFit(dat = dat.voom, 
+                           model = "~ RISK_SCORE", 
+                           patientID = "FULLIDNO",
+                           subset_genes = deg_all, 
+                           subset_var = "condition", subset_lvl = "MEDIA",
+                           use_weights = TRUE,
+                           run_lm = TRUE)
+model_riskT <- kimma::kmFit(dat = dat.voom, 
+                           model = "~ RISK_SCORE", 
+                           patientID = "FULLIDNO",
+                           subset_genes = deg_all, 
+                           subset_var = "condition", subset_lvl = "TB",
+                           use_weights = TRUE,
+                           run_lm = TRUE)
+
+model_risk_all <- model_riskM$lm %>% 
+  mutate(condition = "MEDIA") %>% 
+  bind_rows(model_riskT$lm %>% mutate(condition = "TB")) %>% 
+  filter(variable=="RISK_SCORE")
+
+write_csv(file = "results/model_fitting/HIVpos_risk_model.csv", model_risk_all)
+```
+
+Risk score is associated with 2 RSTR DEGs in the media but not TB condition.
+
+```{r}
+model_risk_all %>% 
+  filter(FDR < 0.2) %>% 
+  select(condition, gene, variable, estimate, FDR)
+```
+
+# R session
+
+```{r}
+sessionInfo()
+```
